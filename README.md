@@ -164,13 +164,15 @@ python depthnav/scripts/eval_logger.py \
 MIT
 
 ## Citation
-If you use this work in your research, kindly consider citing us:
+If you use [this work](https://arxiv.org/abs/2509.08177) in your research, kindly consider citing us:
 ```bibtex
 @inproceedings{lee_quadrotor_2026,
   title = {{{Quadrotor Navigation}} using {{Reinforcement Learning}} with {{Privileged Information}}},
   author = {Lee, Jonathan and Rathod, Abhishek and Goel, Kshitij and Stecklein, John and Tabib, Wennie},
   year = {2025},
-  month= {Sept}
+  month= {Sept},
+  url={https://arxiv.org/abs/2509.08177},
+  doi={10.48550/arXiv.2509.08177}
 } 
 ```
 

@@ -92,7 +92,9 @@ class MlpPolicy(nn.Module):
         th.save(self.state_dict(), filepath)
 
     def load(self, filepath):
-        self.load_state_dict(th.load(filepath))
+        # map_location: checkpoints are saved on CUDA; without it the load
+        # hard-fails on CPU-only deploy boxes.
+        self.load_state_dict(th.load(filepath, map_location=self.device))
         self.to(self.device)
 
     @property

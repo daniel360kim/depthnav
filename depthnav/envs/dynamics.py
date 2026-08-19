@@ -15,6 +15,7 @@ class ACTION_TYPE(Enum):
     THRUST_BODY_FRAME = 0
     THRUST_WORLD_FRAME = 1
     THRUST_START_FRAME = 2
+    VELOCITY_WORLD_FRAME = 3
 
 
 class PointMassDynamics:
@@ -22,6 +23,7 @@ class PointMassDynamics:
         "thrust_body_frame": ACTION_TYPE.THRUST_BODY_FRAME,
         "thrust_world_frame": ACTION_TYPE.THRUST_WORLD_FRAME,
         "thrust_start_frame": ACTION_TYPE.THRUST_START_FRAME,
+        "velocity_world_frame": ACTION_TYPE.VELOCITY_WORLD_FRAME,
         # can add future support for other action types
     }
 
@@ -41,6 +43,12 @@ class PointMassDynamics:
         enable_ctrl_smoothing: bool = False,
         air_drag_theta_1: float = 0.1,
         air_drag_theta_2: float = 0.1,
+        vel_p_gain_xy: float = 1.8,
+        vel_p_gain_z: float = 4.0,
+        max_acc_xy: float = 17.0,
+        min_acc_z: float = 0.5,
+        max_acc_z: float = 19.6,
+        motor_lag_lmbda: Union[float, List[float]] = (11.8, 18.2),
         device: th.device = th.device("cpu"),
     ):
         assert action_type in self.action_type_alias.keys()
@@ -67,9 +75,44 @@ class PointMassDynamics:
         self.air_drag_theta_2 = air_drag_theta_2
         self.default_action = -self.g
 
+        # --- velocity-command mode (VELOCITY_WORLD_FRAME): explicit PX4
+        # velocity-loop model, so the policy's action is the same velocity
+        # setpoint the deployment sends over SET_POSITION_TARGET_LOCAL_NED.
+        #   accel setpoint = P * (v_sp - v) + hover feedforward   (PX4
+        #     MPC_XY_VEL_P_ACC / MPC_Z_VEL_P_ACC defaults 1.8 / 4.0)
+        #   clamped to the vehicle accel box (defaults from superfly
+        #     configs/vehicles/starling2max.yaml: xy g*sqrt(3), z 2g)
+        #   first-order rotor lag on the thrust vector, rate lmbda = 1/tau
+        #     (starling sys-ID tau 55..85 ms -> lmbda in [11.8, 18.2],
+        #     resampled per env at reset; pass a scalar to disable the
+        #     randomization).
+        # The feedforward is the NOMINAL 9.81, not the per-env randomized
+        # gravity: the mismatch stands in for hover-thrust estimation error,
+        # which the P loop cannot fully cancel -- as on the real vehicle.
+        self.vel_p_gains = th.tensor(
+            [[vel_p_gain_xy, vel_p_gain_xy, vel_p_gain_z]], device=device
+        )
+        self.max_acc_xy = max_acc_xy
+        self.min_acc_z = min_acc_z
+        self.max_acc_z = max_acc_z
+        self.hover_ff = th.tensor([[0.0, 0.0, 9.81]], device=device)
+        if isinstance(motor_lag_lmbda, (int, float)):
+            self.motor_lag_lmbda_range = (float(motor_lag_lmbda), float(motor_lag_lmbda))
+        else:
+            lo, hi = motor_lag_lmbda
+            self.motor_lag_lmbda_range = (float(lo), float(hi))
+        self._motor_lag_lmbda = self._sample_motor_lag_lmbda(self.N)
+        self._thrust_state = self.hover_ff.expand(self.N, 3).clone()
+
         # can't apply smoothing in body frame, as reference frame is always changing
         assert not (
             enable_ctrl_smoothing and self.action_type == ACTION_TYPE.THRUST_BODY_FRAME
+        )
+        # velocity mode models the control-loop response itself; the thrust
+        # smoothing filter would double-count it
+        assert not (
+            enable_ctrl_smoothing
+            and self.action_type == ACTION_TYPE.VELOCITY_WORLD_FRAME
         )
         if enable_ctrl_smoothing:
             # control smoothing weights should follow an exponential decay and sum to 1
@@ -151,6 +194,8 @@ class PointMassDynamics:
             self.g = th.tensor([[0.0, 0.0, -9.81]], device=self.device).expand(
                 self.N, 3
             )
+            self._thrust_state = self.hover_ff.expand(self.N, 3).clone()
+            self._motor_lag_lmbda = self._sample_motor_lag_lmbda(self.N)
         else:
             # NOTE we use th.scatter to prevent in-place ops which are not
             # supported by autograd, as it will break the computation graph
@@ -207,6 +252,14 @@ class PointMassDynamics:
                     1, self.exp_smoothing_window_len, 1
                 ),
             )
+            self._thrust_state = self._thrust_state.scatter(
+                0, indices3, self.hover_ff.expand(len(indices), 3)
+            )
+            self._motor_lag_lmbda = self._motor_lag_lmbda.scatter(
+                0,
+                indices.unsqueeze(1),
+                self._sample_motor_lag_lmbda(len(indices)),
+            )
 
     def apply_control_smoothing(self, action: torch.Tensor):
         assert action.shape[0] == self.N
@@ -231,6 +284,8 @@ class PointMassDynamics:
             self._step_thrust_world_frame(acc_cmd, target_dir)
         elif self.action_type == ACTION_TYPE.THRUST_START_FRAME:
             self._step_thrust_start_frame(acc_cmd, target_dir)
+        elif self.action_type == ACTION_TYPE.VELOCITY_WORLD_FRAME:
+            self._step_velocity_world_frame(acc_cmd, target_dir)
         else:
             raise NotImplementedError
 
@@ -286,6 +341,39 @@ class PointMassDynamics:
         acc_cmd_wf = self._rotate_vector_start_to_world(acc_cmd_sf)
         target_dir_wf = self._rotate_vector_start_to_world(target_dir_sf)
         self._step_thrust_world_frame(acc_cmd_wf, target_dir_wf)
+
+    def _sample_motor_lag_lmbda(self, n: int) -> th.Tensor:
+        lo, hi = self.motor_lag_lmbda_range
+        return lo + (hi - lo) * th.rand((n, 1), device=self.device)
+
+    def _step_velocity_world_frame(self, vel_sp_wf: th.Tensor, target_dir_wf: th.Tensor):
+        """
+        update step given a velocity setpoint, through the explicit
+        PX4-velocity-loop model (see __init__): P on velocity error + hover
+        feedforward -> accel box clamp -> first-order rotor lag -> the thrust
+        integrator. Orientation falls out of the lagged thrust vector exactly
+        as in the thrust modes.
+        vel_sp_wf: (N, 3) velocity setpoint in m/s, world frame
+        target_dir_wf: (N, 3) target direction vector
+        """
+        assert vel_sp_wf.shape == (self.N, 3)
+        vel_sp_wf = vel_sp_wf.to(self.device)
+
+        acc_sp = self.vel_p_gains * (vel_sp_wf - self._velocity)
+        thrust_cmd = acc_sp + self.hover_ff
+        # accel box: xy clamped on the norm, z on the component (thrust can
+        # neither reverse nor exceed the vehicle's max)
+        xy = thrust_cmd[:, 0:2]
+        xy_norm = xy.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        xy = xy * (xy_norm.clamp(max=self.max_acc_xy) / xy_norm)
+        z = thrust_cmd[:, 2:3].clamp(min=self.min_acc_z, max=self.max_acc_z)
+        thrust_cmd = th.cat([xy, z], dim=1)
+
+        alpha = 1.0 - th.exp(-self._motor_lag_lmbda * self.ctrl_dt)
+        self._thrust_state = self._thrust_state + alpha * (
+            thrust_cmd - self._thrust_state
+        )
+        self._step_thrust_world_frame(self._thrust_state, target_dir_wf)
 
     def _step_thrust_world_frame(self, acc_cmd_wf: th.Tensor, target_dir_wf: th.Tensor):
         """
@@ -450,6 +538,7 @@ class PointMassDynamics:
         self._last_acceleration = self._last_acceleration.clone().detach()
         self._moving_average_velocity = self._moving_average_velocity.clone().detach()
         self._action_history = self._action_history.clone().detach()
+        self._thrust_state = self._thrust_state.clone().detach()
 
     # expose properties as read-only
     @property

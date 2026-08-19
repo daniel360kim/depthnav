@@ -19,6 +19,37 @@ class AccelerationBoundedYaw(nn.Module):
         return acc_bounded_yaw
 
 
+class VelocityBoundedYaw(nn.Module):
+    """action[:3] is a velocity setpoint (m/s) instead of a thrust vector.
+
+    xy is bounded on its norm (PX4 saturates horizontal speed on the norm,
+    MPC_XY_VEL_MAX) and z componentwise (MPC_Z_VEL_MAX_*), both with tanh so
+    the bound is smooth and the gradient never dies at the rail. Yaw matches
+    AccelerationBoundedYaw. Bounds must match what the deployment sends PX4
+    (superfly registry: --max-vel-xy / --max-vel-z).
+    """
+
+    def __init__(self, max_vel_xy=2.5, max_vel_z=1.5, min_yaw=-th.pi, max_yaw=th.pi):
+        super().__init__()
+        self.max_vel_xy = max_vel_xy
+        self.max_vel_z = max_vel_z
+        self.min_yaw = min_yaw
+        self.max_yaw = max_yaw
+
+    def forward(self, z):
+        vel_xy = z[:, 0:2]
+        vel_z = z[:, 2]
+        yaw = z[:, 3]
+
+        xy_norm = vel_xy.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        bounded_xy = vel_xy / xy_norm * self.max_vel_xy * th.tanh(xy_norm / self.max_vel_xy)
+        bounded_z = self.max_vel_z * th.tanh(vel_z / self.max_vel_z)
+        bounded_yaw = self.min_yaw + (self.max_yaw - self.min_yaw) * th.sigmoid(yaw)
+        return th.cat(
+            [bounded_xy, bounded_z.unsqueeze(1), bounded_yaw.unsqueeze(1)], dim=1
+        )
+
+
 class MlpPolicy(nn.Module):
     activation_fn_alias = {
         "relu": nn.ReLU,
@@ -33,6 +64,7 @@ class MlpPolicy(nn.Module):
     output_activation_fn_alias = {
         "identity": nn.Identity,
         "acceleration_bounded_yaw": AccelerationBoundedYaw,
+        "velocity_bounded_yaw": VelocityBoundedYaw,
     }
 
     def __init__(

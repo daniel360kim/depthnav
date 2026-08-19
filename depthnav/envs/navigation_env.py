@@ -18,6 +18,7 @@ class ActionType(Enum):
     THRUST_TARGET_YAW = 1
     THRUST_YAW = 2
     THRUST_YAW_RATE = 3
+    VELOCITY_YAW = 4
 
 
 class Frame(Enum):
@@ -85,6 +86,19 @@ class NavigationEnv(BaseEnv):
             scene_kwargs=scene_kwargs,
             sensor_kwargs=sensor_kwargs,
         )
+
+        # VELOCITY_YAW hands action[:3] to the dynamics as a velocity
+        # setpoint, so the dynamics must be in its velocity-loop mode --
+        # a thrust-mode dynamics would silently integrate ~1 m/s numbers
+        # as ~1 m/s^2 thrust.
+        if self.action_type == ActionType.VELOCITY_YAW:
+            from .dynamics import ACTION_TYPE as DynActionType
+
+            assert self.dynamics.action_type == DynActionType.VELOCITY_WORLD_FRAME, (
+                "action_type=VELOCITY_YAW requires "
+                "dynamics_kwargs.action_type=velocity_world_frame, got "
+                f"{self.dynamics.action_type}"
+            )
 
         # target generator
         self.target_kwargs = target_kwargs or {}
@@ -220,7 +234,8 @@ class NavigationEnv(BaseEnv):
     def step(self, action: th.Tensor, is_test=False):
         device = self.device
 
-        # compute thrust in world frame
+        # rotate action[:3] into the world frame (a thrust vector or, for
+        # VELOCITY_YAW, a velocity setpoint -- the rotation is the same)
         if self.inertial_frame == Frame.START:
             thrust_sb = action[:, 0:3].to(self.device)
             thrust_wf = th.matmul(self.rot_ws.R, thrust_sb.unsqueeze(-1)).squeeze(-1)
@@ -239,7 +254,7 @@ class NavigationEnv(BaseEnv):
             return super().step(thrust_wf, self.target_direction, is_test=is_test)
 
         # else our action type requires us to calculate yaw
-        elif self.action_type == ActionType.THRUST_YAW:
+        elif self.action_type in (ActionType.THRUST_YAW, ActionType.VELOCITY_YAW):
             yaw = action[:, 3].to(self.device)
         elif self.action_type == ActionType.THRUST_YAW_RATE:
             # obtain current yaw by computing angle between world x-axis and body x-axis

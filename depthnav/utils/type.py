@@ -70,7 +70,12 @@ class Cylinder:
         theta = 2.0 * th.pi * th.rand(n, generator=generator)
         x = self.half[0] * th.cos(theta)
         y = self.half[1] * th.sin(theta)
-        z = self.half[2] * th.rand(n) - 0.5
+        # z spans mean +/- half/2, matching Uniform. The previous form,
+        # `half * rand - 0.5`, subtracted an unscaled 0.5 -- identical for
+        # the stock half=1.0 configs, but half=0.0 (the planar variants'
+        # pinned spawn altitude) landed at mean - 0.5 instead of mean,
+        # spawning 0.5 m below the target -- unreachable with vz==0.
+        z = self.half[2] * (th.rand(n, generator=generator) - 0.5)
         samples = th.stack([x, y, z], dim=1) + self.mean
         return samples
 

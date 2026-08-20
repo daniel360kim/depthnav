@@ -27,14 +27,23 @@ class VelocityBoundedYaw(nn.Module):
     the bound is smooth and the gradient never dies at the rail. Yaw matches
     AccelerationBoundedYaw. Bounds must match what the deployment sends PX4
     (superfly registry: --max-vel-xy / --max-vel-z).
+
+    planar=True forces the vz channel to exactly zero (the depthnav analog
+    of diffaero's pmv_planar): the head stays Linear(*, 4) so the state_dict
+    is interchangeable with the 3-D variant, but the policy can only command
+    horizontal velocity and PX4's z loop holds altitude. Deploy MUST load
+    the planar config with a planar checkpoint -- the vz weights are
+    untrained garbage otherwise.
     """
 
-    def __init__(self, max_vel_xy=2.5, max_vel_z=1.5, min_yaw=-th.pi, max_yaw=th.pi):
+    def __init__(self, max_vel_xy=2.5, max_vel_z=1.5, min_yaw=-th.pi,
+                 max_yaw=th.pi, planar=False):
         super().__init__()
         self.max_vel_xy = max_vel_xy
         self.max_vel_z = max_vel_z
         self.min_yaw = min_yaw
         self.max_yaw = max_yaw
+        self.planar = planar
 
     def forward(self, z):
         vel_xy = z[:, 0:2]
@@ -43,7 +52,10 @@ class VelocityBoundedYaw(nn.Module):
 
         xy_norm = vel_xy.norm(dim=1, keepdim=True).clamp(min=1e-6)
         bounded_xy = vel_xy / xy_norm * self.max_vel_xy * th.tanh(xy_norm / self.max_vel_xy)
-        bounded_z = self.max_vel_z * th.tanh(vel_z / self.max_vel_z)
+        if self.planar:
+            bounded_z = th.zeros_like(vel_z)
+        else:
+            bounded_z = self.max_vel_z * th.tanh(vel_z / self.max_vel_z)
         bounded_yaw = self.min_yaw + (self.max_yaw - self.min_yaw) * th.sigmoid(yaw)
         return th.cat(
             [bounded_xy, bounded_z.unsqueeze(1), bounded_yaw.unsqueeze(1)], dim=1

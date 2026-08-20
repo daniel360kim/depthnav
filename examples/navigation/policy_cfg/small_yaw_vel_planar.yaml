@@ -1,0 +1,51 @@
+# Planar velocity-command variant (the depthnav analog of diffaero's
+# pmv_planar): same network and bounds as small_yaw_vel, but the activation
+# forces vz to exactly zero -- the policy commands horizontal velocity only
+# and PX4's z loop holds altitude. Pair with the *_vel_planar train/eval
+# configs (spawn altitude pinned to the target altitude, gravity-z
+# randomization off -- a vz==0 policy cannot correct vertical drift, so it
+# would only be reward noise). Deploy MUST load THIS config with a planar
+# checkpoint: the vz head weights are untrained garbage.
+policy_class: MultiInputPolicy
+policy:
+  feature_extractor_class: StateTargetImageExtractor
+  feature_extractor_kwargs:
+    activation_fn: leaky_relu
+    net_arch:
+      state:
+        mlp_layer: [192]
+        bn: False
+        ln: True
+      target:
+        mlp_layer: [192]
+        bn: False
+        ln: True
+      depth:
+        input_max_pool_H_W: [12, 16]
+        kernel_size: [2, 3, 3]
+        channels: [32, 64, 128]
+        padding: [0, 0, 0]
+        stride: [1, 1, 1]
+        cnn_bn: False
+        mlp_layer: [192]
+        bn: False
+        ln: True
+      concatenate: False
+  net_arch:
+    recurrent:
+      class: GRUCell
+      kwargs:
+        hidden_size: 192
+    mlp_layer: [4]
+  activation_fn: leaky_relu
+  output_activation_fn: velocity_bounded_yaw
+  output_activation_kwargs:
+    max_vel_xy: 2.5
+    max_vel_z: 1.5
+    planar: true
+  device: cuda
+
+update_env_kwargs:
+  action_type: VELOCITY_YAW
+  inertial_frame: START
+  target_type: TARGET_VELOCITY_TARGET_DISTANCE
